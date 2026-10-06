@@ -1389,6 +1389,19 @@ export interface AcpBackgroundRosterDetail {
 }
 
 /** Running background tasks that have a name. Ids without a detail stay off the roster. */
+/** Running ids that belong to one native ACP session. */
+export function acpSessionBackgroundTaskIds(input: {
+  readonly runningTaskIds: ReadonlySet<string>;
+  readonly sessionByTaskId: ReadonlyMap<string, string>;
+  readonly sessionId: string;
+}): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const taskId of input.runningTaskIds) {
+    if (input.sessionByTaskId.get(taskId) === input.sessionId) ids.add(taskId);
+  }
+  return ids;
+}
+
 export function acpPendingBackgroundRoster(input: {
   readonly runningTaskIds: ReadonlySet<string>;
   readonly details: ReadonlyMap<string, AcpBackgroundRosterDetail>;
@@ -2032,11 +2045,15 @@ export function makeAcpAdapterV2(
         const runningBackgroundTaskIds = yield* Ref.make<ReadonlySet<string>>(new Set());
         // Names for the provider-thread roster. Only tasks describeBackgroundTask
         // names are published, so foreground tools never appear as background work.
+        // The session map keeps one ACP session from publishing another's tasks.
         const backgroundTaskDetails = yield* Ref.make<
           ReadonlyMap<string, AcpBackgroundRosterDetail>
         >(new Map());
-        const publishedBackgroundRosterKey = yield* Ref.make("");
-        let syncDescribedBackgroundRoster: Effect.Effect<void> = Effect.void;
+        const backgroundTaskSessionById = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+        const publishedRosterKeyBySession = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+        let syncDescribedBackgroundRoster: (sessionId: string | null) => Effect.Effect<void> = () =>
+          Effect.void;
+        let publishClearedDescribedRosters: Effect.Effect<void> = Effect.void;
         // Task ids with a GENUINE end signal (monitor-ended reminder or
         // TaskOutput completion). Normalized tool statuses are not genuine:
         // Grok Bash re-reports carry exit_code 0 mid-stream. A straggler
@@ -2049,10 +2066,29 @@ export function makeAcpAdapterV2(
         const endedBackgroundTaskIds = yield* Ref.make<ReadonlySet<string>>(new Set());
         const endedBackgroundTaskIdLimit = 128;
 
-        const rememberDescribedBackgroundTask = (toolCall: AcpToolCallState) =>
+        const forgetDescribedBackgroundTask = (taskId: string) =>
+          Effect.gen(function* () {
+            yield* Ref.update(backgroundTaskDetails, (current) => {
+              if (!current.has(taskId)) return current;
+              const next = new Map(current);
+              next.delete(taskId);
+              return next;
+            });
+            yield* Ref.update(backgroundTaskSessionById, (current) => {
+              if (!current.has(taskId)) return current;
+              const next = new Map(current);
+              next.delete(taskId);
+              return next;
+            });
+          });
+
+        const rememberDescribedBackgroundTask = (
+          toolCall: AcpToolCallState,
+          sessionId: string | null,
+        ) =>
           Effect.gen(function* () {
             const described = flavor.describeBackgroundTask?.(toolCall);
-            if (described === undefined) return;
+            if (described === undefined || sessionId === null || sessionId.length === 0) return;
             yield* Ref.update(backgroundTaskDetails, (current) => {
               const existing = current.get(described.taskId);
               if (
@@ -2069,22 +2105,39 @@ export function makeAcpAdapterV2(
               });
               return next;
             });
+            yield* Ref.update(backgroundTaskSessionById, (current) => {
+              if (current.get(described.taskId) === sessionId) return current;
+              const next = new Map(current);
+              next.set(described.taskId, sessionId);
+              return next;
+            });
           });
 
-        const readDescribedBackgroundTasks = () =>
+        const readDescribedBackgroundTasks = (sessionId: string) =>
           Effect.gen(function* () {
             if (flavor.describeBackgroundTask === undefined) return null;
             return acpPendingBackgroundRoster({
-              runningTaskIds: yield* Ref.get(runningBackgroundTaskIds),
+              runningTaskIds: acpSessionBackgroundTaskIds({
+                runningTaskIds: yield* Ref.get(runningBackgroundTaskIds),
+                sessionByTaskId: yield* Ref.get(backgroundTaskSessionById),
+                sessionId,
+              }),
               details: yield* Ref.get(backgroundTaskDetails),
             });
           });
 
         const withDescribedBackgroundRoster = (providerThread: OrchestrationV2ProviderThread) =>
           Effect.gen(function* () {
-            const tasks = yield* readDescribedBackgroundTasks();
+            if (flavor.describeBackgroundTask === undefined) return providerThread;
+            const sessionId = providerThread.nativeThreadRef?.nativeId;
+            if (sessionId === undefined || sessionId.trim().length === 0) return providerThread;
+            const tasks = yield* readDescribedBackgroundTasks(sessionId);
             if (tasks === null) return providerThread;
-            yield* Ref.set(publishedBackgroundRosterKey, JSON.stringify(tasks));
+            yield* Ref.update(publishedRosterKeyBySession, (current) => {
+              const next = new Map(current);
+              next.set(sessionId, JSON.stringify(tasks));
+              return next;
+            });
             return {
               ...providerThread,
               pendingBackgroundTasks: tasks,
@@ -2094,8 +2147,10 @@ export function makeAcpAdapterV2(
         const setBackgroundTaskRunning = (taskId: string, running: boolean) =>
           Effect.gen(function* () {
             if (running && (yield* Ref.get(endedBackgroundTaskIds)).has(taskId)) {
+              yield* forgetDescribedBackgroundTask(taskId);
               return;
             }
+            const owner = (yield* Ref.get(backgroundTaskSessionById)).get(taskId) ?? null;
             yield* Ref.update(runningBackgroundTaskIds, (current) => {
               if (current.has(taskId) === running) return current;
               const next = new Set(current);
@@ -2106,7 +2161,8 @@ export function makeAcpAdapterV2(
               }
               return next;
             });
-            yield* syncDescribedBackgroundRoster;
+            if (!running) yield* forgetDescribedBackgroundTask(taskId);
+            yield* syncDescribedBackgroundRoster(owner ?? (yield* Ref.get(activeSessionId)));
           });
 
         const markBackgroundTaskEnded = (taskId: string) =>
@@ -2138,7 +2194,7 @@ export function makeAcpAdapterV2(
               const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
               const taskId = flavor.extractBackgroundTaskId(toolCall);
               if (taskId === undefined) continue;
-              yield* rememberDescribedBackgroundTask(toolCall);
+              yield* rememberDescribedBackgroundTask(toolCall, notification.sessionId);
               const status = toolStatus(toolCall.status);
               yield* setBackgroundTaskRunning(taskId, status === "pending" || status === "running");
             }
@@ -2146,36 +2202,66 @@ export function makeAcpAdapterV2(
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
-        syncDescribedBackgroundRoster = Effect.gen(function* () {
-          const tasks = yield* readDescribedBackgroundTasks();
-          if (tasks === null) return;
-          const key = JSON.stringify(tasks);
-          if (key === (yield* Ref.get(publishedBackgroundRosterKey))) return;
-          const sessionId = yield* Ref.get(activeSessionId);
-          if (sessionId === null) return;
-          const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId);
-          const turn = yield* Ref.get(activeTurn);
-          const base =
-            known ??
-            (turn !== null && turn.nativeThreadId === sessionId
-              ? turn.input.providerThread
-              : undefined);
-          if (base === undefined) return;
-          const now = yield* DateTime.now;
-          const providerThread: OrchestrationV2ProviderThread = {
-            ...base,
-            pendingBackgroundTasks: tasks,
-            updatedAt: now,
-          };
-          yield* Ref.set(publishedBackgroundRosterKey, key);
-          yield* Ref.update(providerThreadByNativeSessionId, (current) =>
-            new Map(current).set(sessionId, providerThread),
-          );
-          yield* emitProviderEvent({
-            type: "provider_thread.updated",
-            driver,
-            providerThread,
+        syncDescribedBackgroundRoster = (sessionId) =>
+          Effect.gen(function* () {
+            if (sessionId === null || flavor.describeBackgroundTask === undefined) return;
+            const tasks = yield* readDescribedBackgroundTasks(sessionId);
+            if (tasks === null) return;
+            const key = JSON.stringify(tasks);
+            if ((yield* Ref.get(publishedRosterKeyBySession)).get(sessionId) === key) return;
+            const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId);
+            const turn = yield* Ref.get(activeTurn);
+            const base =
+              known ??
+              (turn !== null && turn.nativeThreadId === sessionId
+                ? turn.input.providerThread
+                : undefined);
+            if (base === undefined) return;
+            const now = yield* DateTime.now;
+            const providerThread: OrchestrationV2ProviderThread = {
+              ...base,
+              pendingBackgroundTasks: tasks,
+              updatedAt: now,
+            };
+            yield* Ref.update(publishedRosterKeyBySession, (current) => {
+              const next = new Map(current);
+              next.set(sessionId, key);
+              return next;
+            });
+            yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+              new Map(current).set(sessionId, providerThread),
+            );
+            yield* emitProviderEvent({
+              type: "provider_thread.updated",
+              driver,
+              providerThread,
+            });
           });
+        publishClearedDescribedRosters = Effect.gen(function* () {
+          if (flavor.describeBackgroundTask === undefined) return;
+          const threads = yield* Ref.get(providerThreadByNativeSessionId);
+          const now = yield* DateTime.now;
+          for (const [sessionId, thread] of threads) {
+            if ((thread.pendingBackgroundTasks ?? []).length === 0) continue;
+            const providerThread: OrchestrationV2ProviderThread = {
+              ...thread,
+              pendingBackgroundTasks: [],
+              updatedAt: now,
+            };
+            yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+              new Map(current).set(sessionId, providerThread),
+            );
+            yield* Ref.update(publishedRosterKeyBySession, (current) => {
+              const next = new Map(current);
+              next.set(sessionId, "[]");
+              return next;
+            });
+            yield* emitProviderEvent({
+              type: "provider_thread.updated",
+              driver,
+              providerThread,
+            });
+          }
         });
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
           Effect.void;
@@ -3202,7 +3288,7 @@ export function makeAcpAdapterV2(
               context.persistentBackgroundTaskIds.add(backgroundTaskId);
             }
             const backgroundStatus = projectedStatus ?? toolStatus(toolCall.status);
-            yield* rememberDescribedBackgroundTask(toolCall);
+            yield* rememberDescribedBackgroundTask(toolCall, context.nativeThreadId);
             yield* setBackgroundTaskRunning(
               backgroundTaskId,
               backgroundStatus === "pending" || backgroundStatus === "running",
@@ -6628,13 +6714,16 @@ export function makeAcpAdapterV2(
               yield* Ref.set(continuationRequested, false);
               yield* Ref.set(runningBackgroundTaskIds, new Set());
               yield* Ref.set(backgroundTaskDetails, new Map());
-              yield* Ref.set(publishedBackgroundRosterKey, "");
+              yield* Ref.set(backgroundTaskSessionById, new Map());
+              yield* Ref.set(publishedRosterKeyBySession, new Map());
               yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
               yield* Ref.set(carryoverSubagents, null);
               yield* Ref.set(lastTurnRoute, null);
             }),
           );
-          yield* syncDescribedBackgroundRoster;
+          // The process is gone, so every session's roster is cleared, not only
+          // whichever session happens to be active.
+          yield* publishClearedDescribedRosters;
         });
 
         const finalizeTurn = Effect.fnUntraced(function* (
@@ -6928,6 +7017,11 @@ export function makeAcpAdapterV2(
           if (!restartRequired) return false;
           yield* restartAcpRuntime(threadId);
           yield* Ref.set(runtimeRestartRequired, false);
+          yield* Ref.set(runningBackgroundTaskIds, new Set());
+          yield* Ref.set(backgroundTaskDetails, new Map());
+          yield* Ref.set(backgroundTaskSessionById, new Map());
+          yield* Ref.set(publishedRosterKeyBySession, new Map());
+          yield* publishClearedDescribedRosters;
           yield* Ref.set(activeSessionId, null);
           yield* Ref.set(activeSessionSetup, null);
           yield* Ref.set(activeSelection, null);
@@ -7997,7 +8091,8 @@ export function makeAcpAdapterV2(
                             yield* Ref.set(continuationRequested, false);
                             yield* Ref.set(runningBackgroundTaskIds, new Set());
                             yield* Ref.set(backgroundTaskDetails, new Map());
-                            yield* Ref.set(publishedBackgroundRosterKey, "[]");
+                            yield* Ref.set(backgroundTaskSessionById, new Map());
+                            yield* Ref.set(publishedRosterKeyBySession, new Map());
                             yield* Ref.set(endedBackgroundTaskIds, new Set());
                             yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
                             yield* Ref.set(handledBackgroundTaskIdsInActiveTurn, new Set());

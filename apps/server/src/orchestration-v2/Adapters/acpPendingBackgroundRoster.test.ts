@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { acpPendingBackgroundRoster } from "./AcpAdapterV2.ts";
+import { acpPendingBackgroundRoster, acpSessionBackgroundTaskIds } from "./AcpAdapterV2.ts";
 
 describe("acpPendingBackgroundRoster", () => {
   it("names only running tasks that have a detail, in task id order", () => {
@@ -16,6 +16,27 @@ describe("acpPendingBackgroundRoster", () => {
       { taskId: "mon-1", kind: "monitor", description: "Visible session monitor" },
       { taskId: "shell-1", kind: "command", description: "Visible shell task" },
     ]);
+  });
+
+  it("keeps a session's tasks off another session's roster", () => {
+    const runningTaskIds = new Set(["shell-a", "shell-b"]);
+    const sessionByTaskId = new Map([
+      ["shell-a", "session-a"],
+      ["shell-b", "session-b"],
+    ]);
+    expect(
+      acpPendingBackgroundRoster({
+        runningTaskIds: acpSessionBackgroundTaskIds({
+          runningTaskIds,
+          sessionByTaskId,
+          sessionId: "session-b",
+        }),
+        details: new Map([
+          ["shell-a", { kind: "command", description: "Session A" }],
+          ["shell-b", { kind: "command", description: "Session B" }],
+        ]),
+      }),
+    ).toEqual([{ taskId: "shell-b", kind: "command", description: "Session B" }]);
   });
 
   it("omits a blank description", () => {
