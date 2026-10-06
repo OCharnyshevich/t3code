@@ -5,6 +5,7 @@ import {
   type ChatAttachment,
   type ModelSelection,
   type OrchestrationV2ConversationMessage,
+  type OrchestrationV2PendingBackgroundTask,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2PlanStep,
@@ -334,6 +335,18 @@ export interface AcpAdapterV2Flavor {
    * (e.g. monitor task uuid) so later synthetic text events can update it.
    */
   readonly extractBackgroundTaskId?: (toolCall: AcpToolCallState) => string | undefined;
+  /**
+   * Name a background shell or monitor for the provider-thread roster. Only
+   * tasks this returns are shown while a turn is still running. Persistent
+   * monitors and foreground tools stay unnamed.
+   */
+  readonly describeBackgroundTask?: (toolCall: AcpToolCallState) =>
+    | {
+        readonly taskId: string;
+        readonly kind: "command" | "monitor";
+        readonly description: string;
+      }
+    | undefined;
   /**
    * Optional parse of root-session synthetic text (monitor-event lines, monitor
    * ended reminders). Returns every task mutation in the chunk so coalesced
@@ -1370,6 +1383,33 @@ export function acpPostSettleMonitorPromptShouldSuppress(
   return mutation?.status === "running";
 }
 
+export interface AcpBackgroundRosterDetail {
+  readonly kind: "command" | "monitor";
+  readonly description: string;
+}
+
+/** Running background tasks that have a name. Ids without a detail stay off the roster. */
+export function acpPendingBackgroundRoster(input: {
+  readonly runningTaskIds: ReadonlySet<string>;
+  readonly details: ReadonlyMap<string, AcpBackgroundRosterDetail>;
+}): ReadonlyArray<OrchestrationV2PendingBackgroundTask> {
+  const tasks: Array<OrchestrationV2PendingBackgroundTask> = [];
+  for (const taskId of input.runningTaskIds) {
+    const detail = input.details.get(taskId);
+    if (detail === undefined) continue;
+    const description = detail.description.trim();
+    tasks.push({
+      taskId,
+      kind: detail.kind,
+      ...(description.length === 0 ? {} : { description }),
+    });
+  }
+  tasks.sort((left, right) =>
+    left.taskId < right.taskId ? -1 : left.taskId > right.taskId ? 1 : 0,
+  );
+  return tasks;
+}
+
 export function acpCompletedTurnShouldTerminalizeTool(
   tool: AcpToolCallState,
   flavor: Pick<AcpAdapterV2Flavor, "extractBackgroundTaskId" | "extractSubagentUpdate">,
@@ -1990,6 +2030,13 @@ export function makeAcpAdapterV2(
         // finalizes between monitor events, and the next commentary burst must
         // not reopen a run while the monitor is still streaming.
         const runningBackgroundTaskIds = yield* Ref.make<ReadonlySet<string>>(new Set());
+        // Names for the provider-thread roster. Only tasks describeBackgroundTask
+        // names are published, so foreground tools never appear as background work.
+        const backgroundTaskDetails = yield* Ref.make<
+          ReadonlyMap<string, AcpBackgroundRosterDetail>
+        >(new Map());
+        const publishedBackgroundRosterKey = yield* Ref.make("");
+        let syncDescribedBackgroundRoster: Effect.Effect<void> = Effect.void;
         // Task ids with a GENUINE end signal (monitor-ended reminder or
         // TaskOutput completion). Normalized tool statuses are not genuine:
         // Grok Bash re-reports carry exit_code 0 mid-stream. A straggler
@@ -2001,6 +2048,48 @@ export function makeAcpAdapterV2(
         // single continuation beats failing closed to a dead thread.
         const endedBackgroundTaskIds = yield* Ref.make<ReadonlySet<string>>(new Set());
         const endedBackgroundTaskIdLimit = 128;
+
+        const rememberDescribedBackgroundTask = (toolCall: AcpToolCallState) =>
+          Effect.gen(function* () {
+            const described = flavor.describeBackgroundTask?.(toolCall);
+            if (described === undefined) return;
+            yield* Ref.update(backgroundTaskDetails, (current) => {
+              const existing = current.get(described.taskId);
+              if (
+                existing !== undefined &&
+                existing.kind === described.kind &&
+                existing.description === described.description
+              ) {
+                return current;
+              }
+              const next = new Map(current);
+              next.set(described.taskId, {
+                kind: described.kind,
+                description: described.description,
+              });
+              return next;
+            });
+          });
+
+        const readDescribedBackgroundTasks = () =>
+          Effect.gen(function* () {
+            if (flavor.describeBackgroundTask === undefined) return null;
+            return acpPendingBackgroundRoster({
+              runningTaskIds: yield* Ref.get(runningBackgroundTaskIds),
+              details: yield* Ref.get(backgroundTaskDetails),
+            });
+          });
+
+        const withDescribedBackgroundRoster = (providerThread: OrchestrationV2ProviderThread) =>
+          Effect.gen(function* () {
+            const tasks = yield* readDescribedBackgroundTasks();
+            if (tasks === null) return providerThread;
+            yield* Ref.set(publishedBackgroundRosterKey, JSON.stringify(tasks));
+            return {
+              ...providerThread,
+              pendingBackgroundTasks: tasks,
+            };
+          });
 
         const setBackgroundTaskRunning = (taskId: string, running: boolean) =>
           Effect.gen(function* () {
@@ -2017,6 +2106,7 @@ export function makeAcpAdapterV2(
               }
               return next;
             });
+            yield* syncDescribedBackgroundRoster;
           });
 
         const markBackgroundTaskEnded = (taskId: string) =>
@@ -2048,6 +2138,7 @@ export function makeAcpAdapterV2(
               const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
               const taskId = flavor.extractBackgroundTaskId(toolCall);
               if (taskId === undefined) continue;
+              yield* rememberDescribedBackgroundTask(toolCall);
               const status = toolStatus(toolCall.status);
               yield* setBackgroundTaskRunning(taskId, status === "pending" || status === "running");
             }
@@ -2055,6 +2146,37 @@ export function makeAcpAdapterV2(
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
+        syncDescribedBackgroundRoster = Effect.gen(function* () {
+          const tasks = yield* readDescribedBackgroundTasks();
+          if (tasks === null) return;
+          const key = JSON.stringify(tasks);
+          if (key === (yield* Ref.get(publishedBackgroundRosterKey))) return;
+          const sessionId = yield* Ref.get(activeSessionId);
+          if (sessionId === null) return;
+          const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId);
+          const turn = yield* Ref.get(activeTurn);
+          const base =
+            known ??
+            (turn !== null && turn.nativeThreadId === sessionId
+              ? turn.input.providerThread
+              : undefined);
+          if (base === undefined) return;
+          const now = yield* DateTime.now;
+          const providerThread: OrchestrationV2ProviderThread = {
+            ...base,
+            pendingBackgroundTasks: tasks,
+            updatedAt: now,
+          };
+          yield* Ref.set(publishedBackgroundRosterKey, key);
+          yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+            new Map(current).set(sessionId, providerThread),
+          );
+          yield* emitProviderEvent({
+            type: "provider_thread.updated",
+            driver,
+            providerThread,
+          });
+        });
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
           Effect.void;
 
@@ -3080,6 +3202,7 @@ export function makeAcpAdapterV2(
               context.persistentBackgroundTaskIds.add(backgroundTaskId);
             }
             const backgroundStatus = projectedStatus ?? toolStatus(toolCall.status);
+            yield* rememberDescribedBackgroundTask(toolCall);
             yield* setBackgroundTaskRunning(
               backgroundTaskId,
               backgroundStatus === "pending" || backgroundStatus === "running",
@@ -6504,11 +6627,14 @@ export function makeAcpAdapterV2(
               yield* Ref.set(wakeReports, noWakeReports);
               yield* Ref.set(continuationRequested, false);
               yield* Ref.set(runningBackgroundTaskIds, new Set());
+              yield* Ref.set(backgroundTaskDetails, new Map());
+              yield* Ref.set(publishedBackgroundRosterKey, "");
               yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
               yield* Ref.set(carryoverSubagents, null);
               yield* Ref.set(lastTurnRoute, null);
             }),
           );
+          yield* syncDescribedBackgroundRoster;
         });
 
         const finalizeTurn = Effect.fnUntraced(function* (
@@ -6591,7 +6717,7 @@ export function makeAcpAdapterV2(
             threadId: context.input.threadId,
             providerTurn: turn,
           });
-          const updatedProviderThread: OrchestrationV2ProviderThread = {
+          const updatedProviderThread = yield* withDescribedBackgroundRoster({
             ...context.input.providerThread,
             providerSessionId: input.providerSessionId,
             status: "active",
@@ -6601,7 +6727,7 @@ export function makeAcpAdapterV2(
             contextUsage: context.contextUsage,
             nativeMetadata: context.nativeMetadata,
             updatedAt: now,
-          };
+          });
           yield* Ref.update(providerThreadByNativeSessionId, (current) =>
             new Map(current).set(context.nativeThreadId, updatedProviderThread),
           );
@@ -7001,14 +7127,14 @@ export function makeAcpAdapterV2(
               threadId: turnInput.threadId,
               providerTurn: runningTurn,
             });
-            const activeProviderThread: OrchestrationV2ProviderThread = {
+            const activeProviderThread = yield* withDescribedBackgroundRoster({
               ...turnInput.providerThread,
               providerSessionId: input.providerSessionId,
               status: "active",
               contextUsage: context.contextUsage,
               nativeMetadata: context.nativeMetadata,
               updatedAt: startedAt,
-            };
+            });
             yield* Ref.update(providerThreadByNativeSessionId, (current) =>
               new Map(current).set(requestedSessionId, activeProviderThread),
             );
@@ -7870,6 +7996,8 @@ export function makeAcpAdapterV2(
                             yield* Ref.set(wakeReports, noWakeReports);
                             yield* Ref.set(continuationRequested, false);
                             yield* Ref.set(runningBackgroundTaskIds, new Set());
+                            yield* Ref.set(backgroundTaskDetails, new Map());
+                            yield* Ref.set(publishedBackgroundRosterKey, "[]");
                             yield* Ref.set(endedBackgroundTaskIds, new Set());
                             yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
                             yield* Ref.set(handledBackgroundTaskIdsInActiveTurn, new Set());
@@ -7896,6 +8024,9 @@ export function makeAcpAdapterV2(
                       },
                       status: "idle" as const,
                       updatedAt: now,
+                      ...(flavor.describeBackgroundTask === undefined
+                        ? {}
+                        : { pendingBackgroundTasks: [] }),
                     },
                     providerTurns: [],
                     messages: [],
