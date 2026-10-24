@@ -32,6 +32,11 @@ describe("classifyMarkdownImageSource", () => {
       null,
       "/home/me/.grok/sessions/plain-project/images/shot one.jpg",
     ],
+    [
+      "/home/me/project/sessions/a%2Fb/report.png",
+      null,
+      "/home/me/project/sessions/a/b/report.png",
+    ],
   ])("maps %s to a workspace file", (source, workspaceRoot, path) => {
     expect(classifyMarkdownImageSource(source, workspaceRoot)).toEqual({
       _tag: "WorkspaceFile",

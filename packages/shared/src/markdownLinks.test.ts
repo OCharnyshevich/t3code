@@ -58,6 +58,7 @@ describe("parseMarkdownFileLink", () => {
       "/home/me/.grok/sessions/plain-project/images/shot%20one.jpg",
       "/home/me/.grok/sessions/plain-project/images/shot one.jpg",
     ],
+    ["/home/me/project/sessions/a%2Fb/report.md", "/home/me/project/sessions/a/b/report.md"],
   ])("recognizes %s as a file", (href, path) => {
     expect(parseMarkdownFileLink(href)?.path).toBe(path);
   });

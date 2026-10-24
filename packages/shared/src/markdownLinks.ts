@@ -207,16 +207,15 @@ export function safeDecodeURIComponent(value: string): string {
   }
 }
 
-const ENCODED_PATH_SEPARATOR = /%(?:2f|5c)/i;
-
 /**
  * Percent-decodes a markdown file destination, leaving a Grok session group as written.
  *
  * Grok stores each session under `<grok-home>/sessions/<encoded-cwd>/`. The group
- * directory is the working directory with `/` written as the characters `%2F`.
- * Decoding that segment inserts a slash, so media is looked up at
- * `~/.grok/sessions//home/...` and the file is missing. Other escapes, including
- * `%20` in the rest of the path, still decode.
+ * directory is `encodeURIComponent` of the absolute working directory, so `/`
+ * is the characters `%2F`. Decoding that segment inserts a slash, and media is
+ * looked up at `~/.grok/sessions//home/...`. A relative name under some other
+ * `sessions` directory, such as `a%2Fb`, still decodes to `a/b`. Other escapes,
+ * including `%20` in the rest of the path, still decode.
  */
 export function decodeMarkdownFilePath(value: string): string {
   const group = grokSessionGroupRange(value);
@@ -226,6 +225,18 @@ export function decodeMarkdownFilePath(value: string): string {
     value.slice(group.start, group.end) +
     safeDecodeURIComponent(value.slice(group.end))
   );
+}
+
+/** True when `segment` is exactly `encodeURIComponent` of an absolute path. */
+function isEncodedGrokWorkingDirectory(segment: string): boolean {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(segment);
+  } catch {
+    return false;
+  }
+  if (!(decoded.startsWith("/") || /^[A-Za-z]:[\\/]/.test(decoded))) return false;
+  return encodeURIComponent(decoded).toLowerCase() === segment.toLowerCase();
 }
 
 function grokSessionGroupRange(
@@ -241,7 +252,7 @@ function grokSessionGroupRange(
     const start = at + "/sessions/".length;
     const separator = normalized.indexOf("/", start);
     const end = separator < 0 ? value.length : separator;
-    if (ENCODED_PATH_SEPARATOR.test(value.slice(start, end))) return { start, end };
+    if (isEncodedGrokWorkingDirectory(value.slice(start, end))) return { start, end };
     from = start;
   }
   return null;
