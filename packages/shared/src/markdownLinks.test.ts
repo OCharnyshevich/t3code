@@ -55,6 +55,10 @@ describe("parseMarkdownFileLink", () => {
       "C:\\Users\\me\\.grok\\sessions\\%2FC%3A%5CUsers%5Cme\\images\\1.jpg",
     ],
     [
+      "C:%5CUsers%5Cme%5C.grok%5Csessions%5C%2FC%3A%5Cproject/images/1.jpg",
+      "C:\\Users\\me\\.grok\\sessions\\%2FC%3A%5Cproject/images/1.jpg",
+    ],
+    [
       "/home/me/.grok/sessions/plain-project/images/shot%20one.jpg",
       "/home/me/.grok/sessions/plain-project/images/shot one.jpg",
     ],

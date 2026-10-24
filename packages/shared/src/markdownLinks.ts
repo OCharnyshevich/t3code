@@ -239,19 +239,53 @@ function isEncodedGrokWorkingDirectory(segment: string): boolean {
   return encodeURIComponent(decoded).toLowerCase() === segment.toLowerCase();
 }
 
+const ENCODED_WINDOWS_SEPARATOR = "%5c";
+
+function separatorEndsAt(value: string, end: number): boolean {
+  if (end <= 0) return false;
+  const literal = value[end - 1];
+  if (literal === "/" || literal === "\\") return true;
+  return value.slice(Math.max(0, end - 3), end).toLowerCase() === ENCODED_WINDOWS_SEPARATOR;
+}
+
+/** A real slash, or a `%5C` that stands in for one in an encoded Windows path. */
+function pathSeparatorAt(
+  value: string,
+  index: number,
+): { readonly start: number; readonly end: number } | null {
+  const character = value[index];
+  if (character === "/" || character === "\\") return { start: index, end: index + 1 };
+  if (value.slice(index, index + 3).toLowerCase() === ENCODED_WINDOWS_SEPARATOR) {
+    return { start: index, end: index + 3 };
+  }
+  return null;
+}
+
+function nextLiteralSeparator(value: string, start: number): number {
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "/" || character === "\\") return index;
+  }
+  return value.length;
+}
+
 function grokSessionGroupRange(
   value: string,
 ): { readonly start: number; readonly end: number } | null {
-  // Separator swap is one character for one character, so indexes match `value`.
-  const normalized = value.replaceAll("\\", "/");
-  const lower = normalized.toLowerCase();
+  const lower = value.toLowerCase();
   let from = 0;
   while (from < lower.length) {
-    const at = lower.indexOf("/sessions/", from);
+    const at = lower.indexOf("sessions", from);
     if (at < 0) return null;
-    const start = at + "/sessions/".length;
-    const separator = normalized.indexOf("/", start);
-    const end = separator < 0 ? value.length : separator;
+    // `%5C` is a separator around the sessions directory. Inside the group it
+    // is part of the encoded working directory and must stay encoded.
+    const after = pathSeparatorAt(value, at + "sessions".length);
+    if (!separatorEndsAt(value, at) || after === null) {
+      from = at + "sessions".length;
+      continue;
+    }
+    const start = after.end;
+    const end = nextLiteralSeparator(value, start);
     if (isEncodedGrokWorkingDirectory(value.slice(start, end))) return { start, end };
     from = start;
   }
