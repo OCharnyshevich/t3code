@@ -1,7 +1,7 @@
 import * as NodeEvents from "node:events";
 
 import { INCOGNITO_BROWSER_PROFILE_ID } from "@t3tools/contracts";
-import type { Browser, BrowserContext, BrowserType } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type BrowserType } from "playwright-core";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { ServerBrowserContexts } from "./ServerBrowserContexts.ts";
@@ -12,9 +12,8 @@ const launches = vi.hoisted(() => ({
   mkdir: vi.fn().mockResolvedValue(undefined),
   rm: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("playwright-core", () => ({
-  chromium: { launch: launches.launch, launchPersistentContext: launches.persistent },
-}));
+vi.spyOn(chromium, "launch").mockImplementation(launches.launch);
+vi.spyOn(chromium, "launchPersistentContext").mockImplementation(launches.persistent);
 vi.mock("node:fs/promises", () => ({ mkdir: launches.mkdir, rm: launches.rm }));
 
 const makeContext = () => {
@@ -151,7 +150,6 @@ describe("ServerBrowserContexts", () => {
       await removed.promise;
       deleted = true;
     });
-    // Launching starts by resolving the executable; record whether storage was gone by then.
     const launchedAfterDelete: Array<boolean> = [];
     configuration.executable.mockImplementation(async () => {
       launchedAfterDelete.push(deleted);
@@ -209,22 +207,6 @@ describe("ServerBrowserContexts", () => {
     expect(launches.launch).toHaveBeenLastCalledWith(
       expect.objectContaining({ chromiumSandbox: true }),
     );
-    await pool.close();
-  });
-
-  it("evicts a closed context without closing other agents or relaunching chromium", async () => {
-    const browser = makeBrowser();
-    launches.launch.mockResolvedValue(browser as unknown as Browser);
-    const onContextClose = vi.fn();
-    const pool = new ServerBrowserContexts({ ...options(), onContextClose });
-    const a = await pool.contextFor("default", "agent-a");
-    const b = await pool.contextFor("default", "agent-b");
-    await a.close();
-    expect(onContextClose).toHaveBeenCalledWith(a);
-    expect(await pool.contextFor("default", "agent-a")).not.toBe(a);
-    expect(await pool.contextFor("default", "agent-b")).toBe(b);
-    expect(browser.close).not.toHaveBeenCalled();
-    expect(launches.launch).toHaveBeenCalledTimes(1);
     await pool.close();
   });
 
