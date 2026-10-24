@@ -193,6 +193,46 @@ export function safeDecodeURIComponent(value: string): string {
   }
 }
 
+const ENCODED_PATH_SEPARATOR = /%(?:2f|5c)/i;
+
+/**
+ * Percent-decodes a markdown file destination, leaving a Grok session group as written.
+ *
+ * Grok stores each session under `<grok-home>/sessions/<encoded-cwd>/`. The group
+ * directory is the working directory with `/` written as the characters `%2F`.
+ * Decoding that segment inserts a slash, so media is looked up at
+ * `~/.grok/sessions//home/...` and the file is missing. Other escapes, including
+ * `%20` in the rest of the path, still decode.
+ */
+export function decodeMarkdownFilePath(value: string): string {
+  const group = grokSessionGroupRange(value);
+  if (group === null) return safeDecodeURIComponent(value);
+  return (
+    safeDecodeURIComponent(value.slice(0, group.start)) +
+    value.slice(group.start, group.end) +
+    safeDecodeURIComponent(value.slice(group.end))
+  );
+}
+
+function grokSessionGroupRange(
+  value: string,
+): { readonly start: number; readonly end: number } | null {
+  // Separator swap is one character for one character, so indexes match `value`.
+  const normalized = value.replaceAll("\\", "/");
+  const lower = normalized.toLowerCase();
+  let from = 0;
+  while (from < lower.length) {
+    const at = lower.indexOf("/sessions/", from);
+    if (at < 0) return null;
+    const start = at + "/sessions/".length;
+    const separator = normalized.indexOf("/", start);
+    const end = separator < 0 ? value.length : separator;
+    if (ENCODED_PATH_SEPARATOR.test(value.slice(start, end))) return { start, end };
+    from = start;
+  }
+  return null;
+}
+
 export function normalizeMarkdownLinkDestination(value: string): string {
   const trimmed = value.trim();
   return trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1) : trimmed;
@@ -334,7 +374,7 @@ export function parseMarkdownFileLink(href: string): FilePathPosition | null {
     (normalized.toLowerCase().startsWith("file:") ? parseFileUrlHref(normalized) : null) ??
     splitMarkdownLinkSearchAndHash(normalized);
   // A percent-encoded drive colon (`/c%3A/`) only becomes strippable once decoded.
-  const path = stripSlashPrefixedWindowsDrive(safeDecodeURIComponent(source.path.trim()));
+  const path = stripSlashPrefixedWindowsDrive(decodeMarkdownFilePath(source.path.trim()));
   const hash = safeDecodeURIComponent(source.hash.trim());
   if (path.length === 0 || hasExternalScheme(path)) return null;
 

@@ -34,6 +34,26 @@ describe("classifyMarkdownImageSource", () => {
     ["C:/Users/dara/project/image.png", null, "C:/Users/dara/project/image.png"],
     ["\\\\server\\share\\image.png", null, "\\\\server\\share\\image.png"],
     ["file:///workspace/project/image%20one.png", null, "/workspace/project/image one.png"],
+    [
+      "/home/me/.grok/sessions/%2Fhome%2Fme%2Fpet.projects%2Fapp/01a16f63-11b2-7911-89e6-d5f9a29acb90/images/1.jpg",
+      null,
+      "/home/me/.grok/sessions/%2Fhome%2Fme%2Fpet.projects%2Fapp/01a16f63-11b2-7911-89e6-d5f9a29acb90/images/1.jpg",
+    ],
+    [
+      "file:///home/me/.grok/sessions/%2Fhome%2Fme%2FMy%20App/id/images/shot%20one.jpg",
+      null,
+      "/home/me/.grok/sessions/%2Fhome%2Fme%2FMy%20App/id/images/shot one.jpg",
+    ],
+    [
+      "/opt/grok-data/sessions/%2Fhome%2Fme%2Fproj/id/images/1.jpg",
+      null,
+      "/opt/grok-data/sessions/%2Fhome%2Fme%2Fproj/id/images/1.jpg",
+    ],
+    [
+      "/home/me/.grok/sessions/plain-project/images/shot%20one.jpg",
+      null,
+      "/home/me/.grok/sessions/plain-project/images/shot one.jpg",
+    ],
     ["file:///C:/Users/dara/project/image.png", null, "C:/Users/dara/project/image.png"],
     ["file://localhost/C:/Users/dara/project/image.png", null, "C:/Users/dara/project/image.png"],
     ["file://server/share/image.png", null, "\\\\server\\share\\image.png"],

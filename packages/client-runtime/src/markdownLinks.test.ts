@@ -120,6 +120,26 @@ describe("parseMarkdownFileLink", () => {
     ["apps/mobile/src/index.ts:10", "apps/mobile/src/index.ts"],
     ["docs/My%20Folder/checklist.xml", "docs/My Folder/checklist.xml"],
     ["Updated%20cutover%20checklist.md", "Updated cutover checklist.md"],
+    [
+      "/home/me/.grok/sessions/%2Fhome%2Fme%2FMy%20App/id/images/shot%20one.jpg",
+      "/home/me/.grok/sessions/%2Fhome%2Fme%2FMy%20App/id/images/shot one.jpg",
+    ],
+    [
+      "file:///home/me/.grok/sessions/%2Fhome%2Fme%2Fproj/id/images/1.jpg",
+      "/home/me/.grok/sessions/%2Fhome%2Fme%2Fproj/id/images/1.jpg",
+    ],
+    [
+      "/opt/grok-data/sessions/%2Fhome%2Fme%2Fproj/id/images/1.jpg",
+      "/opt/grok-data/sessions/%2Fhome%2Fme%2Fproj/id/images/1.jpg",
+    ],
+    [
+      "C:\\Users\\me\\.grok\\sessions\\%2FC%3A%5CUsers%5Cme\\images\\1.jpg",
+      "C:\\Users\\me\\.grok\\sessions\\%2FC%3A%5CUsers%5Cme\\images\\1.jpg",
+    ],
+    [
+      "/home/me/.grok/sessions/plain-project/images/shot%20one.jpg",
+      "/home/me/.grok/sessions/plain-project/images/shot one.jpg",
+    ],
     ["./scripts/deploy", "./scripts/deploy"],
     ["~/notes/today.md", "~/notes/today.md"],
     ["AGENTS.md", "AGENTS.md"],
